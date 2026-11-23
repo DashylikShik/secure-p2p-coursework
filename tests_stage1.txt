@@ -1,0 +1,15 @@
+test_100_frames_with_random_splits_and_coalescing (test_protocol.ProtocolTests.test_100_frames_with_random_splits_and_coalescing) ... ok
+test_header_is_24_bytes (test_protocol.ProtocolTests.test_header_is_24_bytes) ... ok
+test_rejects_bad_json (test_protocol.ProtocolTests.test_rejects_bad_json) ... ok
+test_rejects_oversized_outgoing_payload (test_protocol.ProtocolTests.test_rejects_oversized_outgoing_payload) ... ok
+test_rejects_oversized_payload_before_reading_it (test_protocol.ProtocolTests.test_rejects_oversized_payload_before_reading_it) ... ok
+test_rejects_partial_header (test_protocol.ProtocolTests.test_rejects_partial_header) ... ok
+test_rejects_partial_payload (test_protocol.ProtocolTests.test_rejects_partial_payload) ... ok
+test_rejects_unknown_type (test_protocol.ProtocolTests.test_rejects_unknown_type) ... ok
+test_rejects_wrong_version (test_protocol.ProtocolTests.test_rejects_wrong_version) ... ok
+test_request_id_correspondence (test_protocol.ProtocolTests.test_request_id_correspondence) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.002s
+
+OK

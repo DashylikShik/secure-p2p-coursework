@@ -1,0 +1,2 @@
+# Stage 2: audited Ed25519 primitives; do not implement cryptography yourself.
+cryptography>=44,<51
