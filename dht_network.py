@@ -1,8 +1,8 @@
-"""Сетевой пилот Kademlia-lite: подписанный RPC PING и FIND_NODE поверх TCP.
+"""Учебный узел Kademlia: подписанные RPC поверх TCP или взаимного TLS 1.3.
 
-Этап 2, часть 3. Каждая DHTNode имеет собственный identity, порт и таблицу.
-Это НЕ TLS: данные читаются в сети в открытом виде (этап 4 исправит).
-Bootstrap-адреса передаются узлу снаружи, полного реестра NodeID->IP нет.
+Если переданы TLS credentials, узел НИКОГДА не понижает соединение до открытого TCP.
+Открытый TCP оставлен по умолчанию только для воспроизведения старых пилотных
+демонстраций; реальные испытания этапа 4 используют TLS явно.
 """
 from __future__ import annotations
 
@@ -12,11 +12,13 @@ import os
 import secrets
 import math
 import socket
+import ssl
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from replay_guard import ReplayGuard
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,9 @@ from protocol import (
     make_frame, read_frame
 )
 from dht_records import LocalRecordStore, RecordRejected, verify_node_record
+from tls_channel import (TlsCredentials, server_tls_context, client_tls_context,
+                         verify_expected_peer, verified_certificate_identity,
+                         check_local_tls_identity)
 from routing import Contact, RoutingTable, xor_distance, bucket_index, validate_node_id
 
 DOMAIN = b'coursework-kademlia-rpc-v1:'
@@ -40,7 +45,8 @@ def canonical_bytes(value: dict) -> bytes:
 
 
 def make_envelope(identity: Identity, request_id: bytes, kind: str,
-                  body: dict, host: str, port: int) -> dict:
+                  body: dict, host: str, port: int, *,
+                  session_id: bytes | None = None, message_id: bytes | None = None) -> dict:
     """Подпись связывает отправителя, адрес, тип RPC и request_id."""
     unsigned = {
         'node_id': identity.node_id.hex(),
@@ -51,6 +57,13 @@ def make_envelope(identity: Identity, request_id: bytes, kind: str,
         'request_id': request_id.hex(),
         'body': body,
     }
+    if (session_id is None) != (message_id is None):
+        raise ValueError('session_id и message_id должны задаваться вместе')
+    if session_id is not None:
+        if type(session_id) is not bytes or len(session_id) != 16 or type(message_id) is not bytes or len(message_id) != 16:
+            raise ValueError('session_id/message_id должны иметь длину 16 байт')
+        unsigned['session_id'] = session_id.hex()
+        unsigned['message_id'] = message_id.hex()
     result = dict(unsigned)
     result['signature'] = identity.sign(DOMAIN + canonical_bytes(unsigned)).hex()
     return result
@@ -77,13 +90,31 @@ def _local_contact(node_id: bytes, host: str, port: int) -> Contact:
 
 def verify_envelope(envelope: dict, request_id: bytes, expected_kind: str,
                     expected_id: bytes | None = None,
-                    expected_key: bytes | None = None) -> tuple[Contact, bytes, dict]:
+                    expected_key: bytes | None = None, *,
+                    require_replay: bool = False,
+                    expected_session_id: bytes | None = None,
+                    expected_message_id: bytes | None = None) -> tuple[Contact, bytes, dict]:
     """Проверить подписанный RPC. Не означает полную TLS-аутентификацию!"""
     if not isinstance(envelope, dict):
         raise ValueError('RPC должен быть JSON-объектом')
-    if set(envelope) != {'node_id', 'public_key', 'host', 'port',
-                         'kind', 'request_id', 'body', 'signature'}:
+    base_fields = {'node_id', 'public_key', 'host', 'port',
+                   'kind', 'request_id', 'body', 'signature'}
+    replay_fields = {'session_id', 'message_id'}
+    fields = set(envelope)
+    if fields not in (base_fields, base_fields | replay_fields):
         raise ValueError('Неверные поля подписанного RPC')
+    has_replay = fields == base_fields | replay_fields
+    if require_replay and not has_replay:
+        raise ValueError('TLS RPC требует session_id и message_id')
+    if has_replay:
+        session = _strict_hex(envelope['session_id'], 16)
+        message = _strict_hex(envelope['message_id'], 16)
+        if expected_session_id is not None and session != expected_session_id:
+            raise ValueError('session_id ответа не совпадает')
+        if expected_message_id is not None and message != expected_message_id:
+            raise ValueError('message_id ответа не совпадает')
+    elif expected_session_id is not None or expected_message_id is not None:
+        raise ValueError('Ответ без session_id или message_id')
     public_key = _strict_hex(envelope['public_key'], 32)
     claimed_id = _strict_hex(envelope['node_id'], 32)
     signature = _strict_hex(envelope['signature'], 64)
@@ -207,7 +238,8 @@ class DHTNode:
 
     def __init__(self, identity: Identity, name: str, port: int = 0, *,
                  host: str = '127.0.0.1', k: int = 3, alpha: int = 3,
-                 timeout: float = 1.5):
+                 timeout: float = 1.5,
+                 tls_credentials: TlsCredentials | None = None):
         if host != '127.0.0.1' or not (0 <= port <= 65535):
             raise ValueError('Этот пилот работает только на localhost')
         if k != 3 or alpha != 3:
@@ -219,6 +251,17 @@ class DHTNode:
         self.k = k
         self.alpha = alpha
         self.timeout = timeout
+        # Без tls_credentials сохраняем прежние демонстрации. В TLS-режиме
+        # оба контекста требуют TLSv1.3 + сертификат с доверенной CA.
+        if tls_credentials is not None:
+            check_local_tls_identity(tls_credentials, identity.node_id)
+        self._tls_server_context = (server_tls_context(tls_credentials)
+                                    if tls_credentials is not None else None)
+        self._tls_client_context = (client_tls_context(tls_credentials)
+                                    if tls_credentials is not None else None)
+        self.tls_enabled = tls_credentials is not None
+        self._tls_accepted = 0
+        self._tls_outbound = 0
         self.routing = RoutingTable(identity.node_id, k)
         # Локальная DHT-база: закрытый ключ здесь никогда не хранится.
         self.record_store = LocalRecordStore()
@@ -234,6 +277,9 @@ class DHTNode:
         self._refresh_runs = 0
         self._refresh_errors: list[str] = []
         self._probe_events: list[dict] = []
+        # Shared across all TLS connections of this node, not per socket.
+        # Old legacy plaintext examples remain explicitly unprotected.
+        self._replay_guard = ReplayGuard(max_entries=4096, window_seconds=3600.0)
 
     @property
     def contact(self) -> Contact:
@@ -277,58 +323,88 @@ class DHTNode:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
+        """Verify TLS peer before reading/acting on any DHT frame."""
         with conn:
             conn.settimeout(self.timeout)
             try:
-                frame = read_frame(conn)
-                if frame['type'] == PING:
-                    expected_kind, out_type, out_kind = 'PING', PONG, 'PONG'
-                elif frame['type'] == FIND_NODE_REQUEST:
-                    expected_kind, out_type, out_kind = 'FIND_NODE_REQUEST', FIND_NODE_RESPONSE, 'FIND_NODE_RESPONSE'
-                elif frame['type'] == STORE_REQUEST:
-                    expected_kind, out_type, out_kind = 'STORE_REQUEST', STORE_RESPONSE, 'STORE_RESPONSE'
-                elif frame['type'] == FIND_VALUE_REQUEST:
-                    expected_kind, out_type, out_kind = 'FIND_VALUE_REQUEST', FIND_VALUE_RESPONSE, 'FIND_VALUE_RESPONSE'
+                if self._tls_server_context is None:
+                    self._handle_connection(conn, None, None)
                 else:
-                    return
-                sender, key, body = verify_envelope(frame['payload'], frame['request_id'], expected_kind)
-                # В таблицу не попадает неподписанный или некорректный NodeID.
-                self._remember(sender, key)
-                if frame['type'] == PING:
-                    answer = {'ok': True}
-                elif frame['type'] == FIND_NODE_REQUEST:
-                    target = _strict_hex(body.get('target'), 32)
-                    answer = {'contacts': self._nearest_wire_contacts(target, sender.node_id)}
-                elif frame['type'] == STORE_REQUEST:
-                    if set(body) != {'key', 'record'}:
-                        raise ValueError('STORE: неверные поля body')
-                    record_key = _strict_hex(body['key'], 32)
-                    signed_record = body['record']
-                    if verify_node_record(signed_record) != record_key:
-                        raise RecordRejected('STORE: ключ не соответствует подписанной записи')
-                    with self._lock:
-                        outcome = self.record_store.put(signed_record)
-                    answer = {'key': record_key.hex(), 'status': outcome}
-                else:
-                    if set(body) != {'key'}:
-                        raise ValueError('FIND_VALUE: неверные поля body')
-                    record_key = _strict_hex(body['key'], 32)
-                    with self._lock:
-                        signed_record = self.record_store.get(record_key)
-                    if signed_record is None:
-                        answer = {'key': record_key.hex(), 'record': None,
-                                  'contacts': self._nearest_wire_contacts(record_key, sender.node_id)}
-                    else:
-                        answer = {'key': record_key.hex(), 'record': signed_record,
-                                  'contacts': []}
-                reply = make_frame(out_type, make_envelope(self.identity, frame['request_id'],
-                                        out_kind, answer, self.host, self.port),
-                                   request_id=frame['request_id'])
-                conn.sendall(reply)
+                    # No fallback to plaintext, even if handshake fails.
+                    with self._tls_server_context.wrap_socket(conn, server_side=True) as protected:
+                        tls_peer_id, tls_peer_key = verified_certificate_identity(protected)
+                        with self._lock:
+                            self._tls_accepted += 1
+                        self._handle_connection(protected, tls_peer_id, tls_peer_key)
             except (ValueError, ConnectionError, OSError, TypeError):
-                # В учебном пилоте отклоняем плохое соединение, не завершаем узел.
+                # One malformed/unauthenticated connection cannot stop the node.
                 return
 
+    def _handle_connection(self, channel: socket.socket, tls_peer_id: bytes | None,
+                           tls_peer_key: bytes | None) -> None:
+        # One authenticated TLS session can contain several DHT frames.
+        # ReplayGuard is per node, so a fresh TLS connection cannot bypass it.
+        while not self._stop.is_set():
+            self._handle_frame(channel, tls_peer_id, tls_peer_key)
+
+    def _handle_frame(self, channel: socket.socket, tls_peer_id: bytes | None,
+                      tls_peer_key: bytes | None) -> None:
+        frame = read_frame(channel)
+        if frame['type'] == PING:
+            expected_kind, out_type, out_kind = 'PING', PONG, 'PONG'
+        elif frame['type'] == FIND_NODE_REQUEST:
+            expected_kind, out_type, out_kind = 'FIND_NODE_REQUEST', FIND_NODE_RESPONSE, 'FIND_NODE_RESPONSE'
+        elif frame['type'] == STORE_REQUEST:
+            expected_kind, out_type, out_kind = 'STORE_REQUEST', STORE_RESPONSE, 'STORE_RESPONSE'
+        elif frame['type'] == FIND_VALUE_REQUEST:
+            expected_kind, out_type, out_kind = 'FIND_VALUE_REQUEST', FIND_VALUE_RESPONSE, 'FIND_VALUE_RESPONSE'
+        else:
+            return
+        sender, key, body = verify_envelope(frame['payload'], frame['request_id'], expected_kind,
+                                               expected_id=tls_peer_id, expected_key=tls_peer_key,
+                                               require_replay=tls_peer_id is not None)
+        if tls_peer_id is not None:
+            # Mark a signed request as used BEFORE routing-table/storage side effects.
+            # Global for node process, not merely this TLS session.
+            self._replay_guard.check_and_mark(sender.node_id,
+                bytes.fromhex(frame['payload']['session_id']),
+                bytes.fromhex(frame['payload']['message_id']))
+        # В таблицу не попадает неподписанный или некорректный NodeID.
+        self._remember(sender, key)
+        if frame['type'] == PING:
+            answer = {'ok': True}
+        elif frame['type'] == FIND_NODE_REQUEST:
+            target = _strict_hex(body.get('target'), 32)
+            answer = {'contacts': self._nearest_wire_contacts(target, sender.node_id)}
+        elif frame['type'] == STORE_REQUEST:
+            if set(body) != {'key', 'record'}:
+                raise ValueError('STORE: неверные поля body')
+            record_key = _strict_hex(body['key'], 32)
+            signed_record = body['record']
+            if verify_node_record(signed_record) != record_key:
+                raise RecordRejected('STORE: ключ не соответствует подписанной записи')
+            with self._lock:
+                outcome = self.record_store.put(signed_record)
+            answer = {'key': record_key.hex(), 'status': outcome}
+        else:
+            if set(body) != {'key'}:
+                raise ValueError('FIND_VALUE: неверные поля body')
+            record_key = _strict_hex(body['key'], 32)
+            with self._lock:
+                signed_record = self.record_store.get(record_key)
+            if signed_record is None:
+                answer = {'key': record_key.hex(), 'record': None,
+                          'contacts': self._nearest_wire_contacts(record_key, sender.node_id)}
+            else:
+                answer = {'key': record_key.hex(), 'record': signed_record,
+                          'contacts': []}
+        replay_kwargs = ({'session_id': bytes.fromhex(frame['payload']['session_id']),
+                          'message_id': bytes.fromhex(frame['payload']['message_id'])}
+                         if tls_peer_id is not None else {})
+        reply = make_frame(out_type, make_envelope(self.identity, frame['request_id'],
+                                out_kind, answer, self.host, self.port, **replay_kwargs),
+                           request_id=frame['request_id'])
+        channel.sendall(reply)
     def _nearest_wire_contacts(self, target: bytes, exclude_id: bytes) -> list[dict]:
         """Отдать только известные контакты, без скрытого глобального каталога."""
         with self._lock:
@@ -403,25 +479,54 @@ class DHTNode:
               expected_id: bytes | None = None,
               expected_key: bytes | None = None) -> tuple[Contact, bytes, dict]:
         request_id = uuid.uuid4().bytes
+        # Each _call opens a fresh TLS connection. Both IDs are signed and
+        # echoed by the server; message_id stays unique across connections.
+        session_id = uuid.uuid4().bytes if self.tls_enabled else None
+        message_id = uuid.uuid4().bytes if self.tls_enabled else None
+        replay_kwargs = ({'session_id': session_id, 'message_id': message_id}
+                         if self.tls_enabled else {})
         payload = make_envelope(self.identity, request_id, out_kind, body,
-                                self.host, self.port)
+                                self.host, self.port, **replay_kwargs)
         frame = make_frame(out_type, payload, request_id=request_id)
-        with socket.create_connection((host, port), timeout=self.timeout) as conn:
-            conn.settimeout(self.timeout)
-            conn.sendall(frame)
-            response = read_frame(conn)
+        if self._tls_client_context is not None and expected_id is None:
+            raise ValueError('TLS RPC требует ожидаемый NodeID: запрещён непроверенный peer')
+        with socket.create_connection((host, port), timeout=self.timeout) as raw:
+            raw.settimeout(self.timeout)
+            if self._tls_client_context is None:
+                raw.sendall(frame)
+                response = read_frame(raw)
+            else:
+                with self._tls_client_context.wrap_socket(raw, server_hostname=None) as protected:
+                    # Verify certificate AND pin BEFORE sending signed DHT request.
+                    verify_expected_peer(protected, expected_id, expected_key)
+                    with self._lock:
+                        self._tls_outbound += 1
+                    protected.sendall(frame)
+                    response = read_frame(protected)
         if response['type'] != reply_type or response['request_id'] != request_id:
             raise ValueError('Неверный тип ответа или request_id')
         contact, key, result = verify_envelope(response['payload'], request_id, reply_kind,
-                                             expected_id=expected_id, expected_key=expected_key)
+                                             expected_id=expected_id, expected_key=expected_key,
+                                             require_replay=self.tls_enabled,
+                                             expected_session_id=session_id,
+                                             expected_message_id=message_id)
         if (contact.host, contact.port) != (host, port):
             raise ValueError('Ответ содержит другой объявленный адрес')
         return contact, key, result
 
-    def bootstrap(self, address: tuple[str, int]) -> Contact:
-        """Начальный контакт по известному IP:порт, без полного списка узлов."""
+    def bootstrap(self, address: tuple[str, int], *,
+                  expected_node_id: bytes | None = None,
+                  expected_public_key: bytes | None = None) -> Contact:
+        """Bootstrap: TLS requires a configured/pinned seed identity.
+
+        Pre-provisioned (seed address + NodeID + public key) is NOT a global
+        node directory: only the first known contact is configured.
+        """
+        if self.tls_enabled and (expected_node_id is None or expected_public_key is None):
+            raise ValueError('TLS bootstrap: нужен закреплённый NodeID и открытый ключ seed-узла')
         contact, key, _ = self._call(address[0], address[1], PING, 'PING',
-                                     PONG, 'PONG', {})
+                                     PONG, 'PONG', {}, expected_id=expected_node_id,
+                                     expected_key=expected_public_key)
         self._remember(contact, key)
         return contact
 
@@ -704,9 +809,16 @@ class DHTNode:
         before = self.routing.size()
         successes = []
         failures = []
-        for host, port in bootstrap_peers:
+        for seed in bootstrap_peers:
+            host, port = seed[:2]
             try:
-                peer = self.bootstrap((host, port))
+                if self.tls_enabled:
+                    if len(seed) != 4:
+                        raise ValueError('TLS join ожидает (host, port, NodeID, public_key)')
+                    peer = self.bootstrap((host, port), expected_node_id=seed[2],
+                                          expected_public_key=seed[3])
+                else:
+                    peer = self.bootstrap((host, port))
                 successes.append(peer.short_id)
             except (OSError, ConnectionError, ValueError) as exc:
                 failures.append(f'{host}:{port} — {type(exc).__name__}: {exc}')
@@ -796,6 +908,17 @@ class DHTNode:
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=max(2.0, self.timeout * 4))
         self._refresh_thread = None
+
+    def replay_statistics(self) -> dict:
+        """Security counters for accepted/blocked authenticated RPC IDs."""
+        return self._replay_guard.statistics()
+
+    def tls_statistics(self) -> dict:
+        """Only non-secret counters for demonstration and experiment logs."""
+        with self._lock:
+            return {'tls_enabled': self.tls_enabled,
+                    'inbound_tls13': self._tls_accepted,
+                    'outbound_tls13': self._tls_outbound}
 
     def table_snapshot(self) -> dict[int, list[str]]:
         with self._lock:
