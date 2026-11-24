@@ -22,8 +22,11 @@ from typing import Any
 
 from identity import Identity, load_or_create_identity, verify_node_id, verify_signature
 from protocol import (
-    PING, PONG, FIND_NODE_REQUEST, FIND_NODE_RESPONSE, make_frame, read_frame
+    PING, PONG, FIND_NODE_REQUEST, FIND_NODE_RESPONSE,
+    STORE_REQUEST, STORE_RESPONSE, FIND_VALUE_REQUEST, FIND_VALUE_RESPONSE,
+    make_frame, read_frame
 )
+from dht_records import LocalRecordStore, RecordRejected, verify_node_record
 from routing import Contact, RoutingTable, xor_distance, bucket_index, validate_node_id
 
 DOMAIN = b'coursework-kademlia-rpc-v1:'
@@ -144,6 +147,61 @@ class LookupResult:
         }
 
 
+@dataclass
+class ValueLookupResult:
+    """Отчёт сетевого FIND_VALUE: запись возвращается только после проверки подписи.
+
+    Запись публичная; закрытых ключей в отчёте нет.
+    """
+    key: str
+    found: bool = False
+    record: dict | None = None
+    iterations: int = 0
+    rpc_count: int = 0
+    errors: list[str] = field(default_factory=list)
+    queried_by_round: list[list[str]] = field(default_factory=list)
+    elapsed_ms: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            'key': self.key, 'found': self.found,
+            'record_owner': self.record['node_id'] if self.record else None,
+            'record_sequence': self.record['sequence_number'] if self.record else None,
+            'iterations': self.iterations, 'rpc_count': self.rpc_count,
+            'errors': self.errors, 'queried_by_round': self.queried_by_round,
+            'elapsed_ms': round(self.elapsed_ms, 3),
+        }
+
+
+@dataclass
+class ReplicaWriteResult:
+    """Проверяемый отчёт о выборе трёх хранителей и подтверждениях STORE."""
+    key: str
+    replication_factor: int = 3
+    required_acks: int = 2
+    selected: list[dict] = field(default_factory=list)
+    acknowledgements: list[dict] = field(default_factory=list)
+    discovery_rpc: int = 0
+    discovery_iterations: int = 0
+    discovery_errors: list[str] = field(default_factory=list)
+    succeeded: bool = False
+    elapsed_ms: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            'key': self.key, 'replication_factor': self.replication_factor,
+            'required_acks': self.required_acks, 'selected': self.selected,
+            'acknowledgements': self.acknowledgements,
+            'ack_count': sum(row['ack'] for row in self.acknowledgements),
+            'stored_copies': sum(row['ack'] for row in self.acknowledgements),
+            'discovery_rpc': self.discovery_rpc,
+            'discovery_iterations': self.discovery_iterations,
+            'discovery_errors': self.discovery_errors,
+            'succeeded': self.succeeded,
+            'elapsed_ms': round(self.elapsed_ms, 3),
+        }
+
+
 class DHTNode:
     """Отдельный узел: свой сокет, identity, k-buckets и известные контакты."""
 
@@ -162,6 +220,8 @@ class DHTNode:
         self.alpha = alpha
         self.timeout = timeout
         self.routing = RoutingTable(identity.node_id, k)
+        # Локальная DHT-база: закрытый ключ здесь никогда не хранится.
+        self.record_store = LocalRecordStore()
         # Кэш только ключей ИЗВЕСТНЫХ проверенных контактов, не каталог сети.
         self._keys: dict[bytes, bytes] = {}
         self._lock = threading.RLock()
@@ -225,6 +285,10 @@ class DHTNode:
                     expected_kind, out_type, out_kind = 'PING', PONG, 'PONG'
                 elif frame['type'] == FIND_NODE_REQUEST:
                     expected_kind, out_type, out_kind = 'FIND_NODE_REQUEST', FIND_NODE_RESPONSE, 'FIND_NODE_RESPONSE'
+                elif frame['type'] == STORE_REQUEST:
+                    expected_kind, out_type, out_kind = 'STORE_REQUEST', STORE_RESPONSE, 'STORE_RESPONSE'
+                elif frame['type'] == FIND_VALUE_REQUEST:
+                    expected_kind, out_type, out_kind = 'FIND_VALUE_REQUEST', FIND_VALUE_RESPONSE, 'FIND_VALUE_RESPONSE'
                 else:
                     return
                 sender, key, body = verify_envelope(frame['payload'], frame['request_id'], expected_kind)
@@ -232,15 +296,31 @@ class DHTNode:
                 self._remember(sender, key)
                 if frame['type'] == PING:
                     answer = {'ok': True}
-                else:
+                elif frame['type'] == FIND_NODE_REQUEST:
                     target = _strict_hex(body.get('target'), 32)
+                    answer = {'contacts': self._nearest_wire_contacts(target, sender.node_id)}
+                elif frame['type'] == STORE_REQUEST:
+                    if set(body) != {'key', 'record'}:
+                        raise ValueError('STORE: неверные поля body')
+                    record_key = _strict_hex(body['key'], 32)
+                    signed_record = body['record']
+                    if verify_node_record(signed_record) != record_key:
+                        raise RecordRejected('STORE: ключ не соответствует подписанной записи')
                     with self._lock:
-                        near = self.routing.nearest(target, self.k)
-                        selected = []
-                        for peer in near:
-                            if peer.node_id != sender.node_id and peer.node_id in self._keys:
-                                selected.append(wire_contact(peer, self._keys[peer.node_id]))
-                    answer = {'contacts': selected}
+                        outcome = self.record_store.put(signed_record)
+                    answer = {'key': record_key.hex(), 'status': outcome}
+                else:
+                    if set(body) != {'key'}:
+                        raise ValueError('FIND_VALUE: неверные поля body')
+                    record_key = _strict_hex(body['key'], 32)
+                    with self._lock:
+                        signed_record = self.record_store.get(record_key)
+                    if signed_record is None:
+                        answer = {'key': record_key.hex(), 'record': None,
+                                  'contacts': self._nearest_wire_contacts(record_key, sender.node_id)}
+                    else:
+                        answer = {'key': record_key.hex(), 'record': signed_record,
+                                  'contacts': []}
                 reply = make_frame(out_type, make_envelope(self.identity, frame['request_id'],
                                         out_kind, answer, self.host, self.port),
                                    request_id=frame['request_id'])
@@ -248,6 +328,13 @@ class DHTNode:
             except (ValueError, ConnectionError, OSError, TypeError):
                 # В учебном пилоте отклоняем плохое соединение, не завершаем узел.
                 return
+
+    def _nearest_wire_contacts(self, target: bytes, exclude_id: bytes) -> list[dict]:
+        """Отдать только известные контакты, без скрытого глобального каталога."""
+        with self._lock:
+            near = self.routing.nearest(target, self.k)
+            return [wire_contact(c, self._keys[c.node_id]) for c in near
+                    if c.node_id != exclude_id and c.node_id in self._keys]
 
     def _probe(self, contact: Contact, expected_key: bytes) -> bool:
         try:
@@ -361,6 +448,193 @@ class DHTNode:
         if not isinstance(raw_contacts, list) or len(raw_contacts) > self.k:
             raise ValueError('Неверное количество контактов FIND_NODE')
         return [parse_contact(raw) for raw in raw_contacts]
+
+    def _discover_live_contacts(self, target: bytes, max_rounds: int = 20) -> tuple[list[Contact], int, int, list[str]]:
+        """Найти доступные адреса через существующие FIND_NODE RPC.
+
+        Список известных ID не передаётся извне. Каждый удалённый контакт
+        включается в кандидаты только после ответа с проверенной подписью.
+        Свой контакт включён в результат без сетевого запроса.
+        """
+        validate_node_id(target)
+        if type(max_rounds) is not int or max_rounds < 1:
+            raise ValueError('max_rounds должен быть положительным целым')
+        if self._server is None:
+            raise RuntimeError('Сначала запустите узел')
+        with self._lock:
+            initial = self.routing.nearest(target, 256)
+            known_keys = dict(self._keys)
+        candidates = {contact.node_id: contact for contact in initial}
+        verified = {self.identity.node_id: self.contact}
+        queried: set[bytes] = set()
+        errors: list[str] = []
+        rpc_count = 0
+        rounds = 0
+        for _ in range(max_rounds):
+            available = [c for c in candidates.values() if c.node_id not in queried]
+            if not available:
+                break
+            available.sort(key=lambda c: (xor_distance(c.node_id, target), c.node_id))
+            selected = available[:self.alpha]
+            queried.update(c.node_id for c in selected)
+            rounds += 1
+            rpc_count += len(selected)
+            with ThreadPoolExecutor(max_workers=self.alpha) as pool:
+                jobs = {pool.submit(self._find_node, peer, known_keys.get(peer.node_id), target): peer
+                        for peer in selected}
+                for future in as_completed(jobs):
+                    peer = jobs[future]
+                    try:
+                        neighbors = future.result()
+                        verified[peer.node_id] = peer
+                        for candidate, public_key in neighbors:
+                            if candidate.node_id == self.identity.node_id:
+                                continue
+                            old_key = known_keys.get(candidate.node_id)
+                            if old_key is not None and old_key != public_key:
+                                raise ValueError('Противоречащий ключ контакта')
+                            if candidate.node_id not in candidates:
+                                candidates[candidate.node_id] = candidate
+                            known_keys[candidate.node_id] = public_key
+                    except (OSError, ConnectionError, ValueError) as exc:
+                        errors.append(f'{peer.short_id}: {type(exc).__name__}: {exc}')
+        return sorted(verified.values(), key=lambda c: (xor_distance(c.node_id, target), c.node_id)), rpc_count, rounds, errors
+
+    def store_replicated(self, record: dict, *, max_rounds: int = 20) -> ReplicaWriteResult:
+        """Разместить подписанную NodeRecord на R=3 ближайших живых узлах.
+
+        Успех операции = минимум два действительных подтверждения из трёх
+        выбранных хранителей. В число хранителей включается и этот узел,
+        если он входит в тройку ближайших по XOR к DHT-ключу записи.
+        """
+        record_key = verify_node_record(record)  # до любого сетевого обращения
+        begin = time.perf_counter()
+        result = ReplicaWriteResult(key=record_key.hex())
+        reachable, rpc, iterations, errors = self._discover_live_contacts(record_key, max_rounds)
+        result.discovery_rpc = rpc
+        result.discovery_iterations = iterations
+        result.discovery_errors = errors
+        selected = reachable[:result.replication_factor]
+        for peer in selected:
+            result.selected.append({
+                'node_id': peer.node_id.hex(), 'host': peer.host, 'port': peer.port,
+                'xor_distance': xor_distance(peer.node_id, record_key),
+            })
+        for peer in selected:
+            ack = False
+            try:
+                if peer.node_id == self.identity.node_id:
+                    with self._lock:
+                        status = self.record_store.put(record)
+                else:
+                    status = self.store_record_at(peer, record)
+                ack = status in ('stored', 'updated', 'duplicate')
+                description = status
+            except (OSError, ConnectionError, ValueError) as exc:
+                description = f'{type(exc).__name__}: {exc}'
+            result.acknowledgements.append({
+                'node_id': peer.node_id.hex(), 'ack': ack, 'status': description,
+            })
+        result.succeeded = (len(selected) == result.replication_factor and
+                            sum(item['ack'] for item in result.acknowledgements) >= result.required_acks)
+        result.elapsed_ms = (time.perf_counter() - begin) * 1000
+        return result
+
+    def store_record_at(self, peer: Contact, record: dict) -> str:
+        """Сетевой STORE одному выбранному хранителю (без репликации пока).
+
+        Вызывающий должен заранее узнать peer через bootstrap/FIND_NODE.
+        Это не распределение на R=3 ближайших узлах — следующий подэтап.
+        """
+        key = verify_node_record(record)
+        with self._lock:
+            expected_key = self._keys.get(peer.node_id)
+        sender, public_key, body = self._call(
+            peer.host, peer.port, STORE_REQUEST, 'STORE_REQUEST',
+            STORE_RESPONSE, 'STORE_RESPONSE', {'key': key.hex(), 'record': record},
+            expected_id=peer.node_id, expected_key=expected_key)
+        if set(body) != {'key', 'status'} or body['key'] != key.hex() or body['status'] not in (
+                'stored', 'updated', 'duplicate'):
+            raise ValueError('STORE: некорректное подтверждение')
+        self._remember(sender, public_key)
+        return body['status']
+
+    def _find_value(self, peer: Contact, expected_key: bytes | None,
+                    record_key: bytes) -> tuple[dict | None, list[tuple[Contact, bytes]]]:
+        sender, public_key, body = self._call(
+            peer.host, peer.port, FIND_VALUE_REQUEST, 'FIND_VALUE_REQUEST',
+            FIND_VALUE_RESPONSE, 'FIND_VALUE_RESPONSE', {'key': record_key.hex()},
+            expected_id=peer.node_id, expected_key=expected_key)
+        self._remember(sender, public_key)
+        if set(body) != {'key', 'record', 'contacts'} or body['key'] != record_key.hex():
+            raise ValueError('FIND_VALUE: неверный ответ')
+        raw = body['record']
+        raw_contacts = body['contacts']
+        if not isinstance(raw_contacts, list) or len(raw_contacts) > self.k:
+            raise ValueError('FIND_VALUE: неверный список контактов')
+        if raw is not None:
+            if raw_contacts or verify_node_record(raw) != record_key:
+                raise RecordRejected('FIND_VALUE: повреждённая или чужая запись')
+            return raw, []
+        return None, [parse_contact(entry) for entry in raw_contacts]
+
+    def lookup_value(self, record_key: bytes, *, max_rounds: int = 20) -> ValueLookupResult:
+        """Итеративный FIND_VALUE (ALPHA=3), цель — ключ подписанной записи.
+
+        Результат успешен, только если получена действительная подписанная запись.
+        Отсутствующий ключ возвращает found=False без исключения.
+        """
+        validate_node_id(record_key)
+        started = time.perf_counter()
+        result = ValueLookupResult(key=record_key.hex())
+        with self._lock:
+            local = self.record_store.get(record_key)
+            initial = self.routing.nearest(record_key, 256)
+            known_keys = dict(self._keys)
+        if local is not None:
+            result.found = True
+            result.record = local
+            result.elapsed_ms = (time.perf_counter() - started) * 1000
+            return result
+        candidates = {c.node_id: c for c in initial}
+        queried: set[bytes] = set()
+        for _ in range(max_rounds):
+            available = [c for c in candidates.values() if c.node_id not in queried]
+            if not available:
+                break
+            available.sort(key=lambda c: (xor_distance(c.node_id, record_key), c.node_id))
+            selected = available[:self.alpha]
+            queried.update(c.node_id for c in selected)
+            result.iterations += 1
+            result.rpc_count += len(selected)
+            result.queried_by_round.append([c.short_id for c in selected])
+            with ThreadPoolExecutor(max_workers=self.alpha) as pool:
+                futures = {pool.submit(self._find_value, c, known_keys.get(c.node_id), record_key): c
+                           for c in selected}
+                for future in as_completed(futures):
+                    peer = futures[future]
+                    try:
+                        record, neighbors = future.result()
+                        if record is not None:
+                            result.found = True
+                            # Если несколько хранителей отвечают разными версиями, выбираем старшую.
+                            if result.record is None or record['sequence_number'] > result.record['sequence_number']:
+                                result.record = record
+                        for contact, key in neighbors:
+                            if contact.node_id == self.identity.node_id:
+                                continue
+                            previous_key = known_keys.get(contact.node_id)
+                            if previous_key is not None and previous_key != key:
+                                raise ValueError('Противоречащий ключ контакта')
+                            if contact.node_id not in candidates:
+                                candidates[contact.node_id] = contact
+                                known_keys[contact.node_id] = key
+                    except (OSError, ConnectionError, ValueError) as exc:
+                        result.errors.append(f'{peer.short_id}: {type(exc).__name__}: {exc}')
+            if result.found:
+                break
+        result.elapsed_ms = (time.perf_counter() - started) * 1000
+        return result
 
     def lookup_node(self, target_id: bytes, *, max_rounds: int = 20) -> LookupResult:
         """Итеративный поиск с максимум ALPHA=3 параллельными RPC в раунде.
